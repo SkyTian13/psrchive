@@ -1887,6 +1887,8 @@ float getRMS (const Archive * archive)
   double weighted_total_variance = 0;
   double total_weight = 0;
 
+  #pragma omp parallel for default(none) reduction(+:weighted_total_variance, total_weight) \
+    firstprivate(archive, nbin, nchan, nsub)
   for (unsigned is = 0; is < nsub ; is++)
   {
     for (unsigned ic = 0; ic < nchan; ic++)
