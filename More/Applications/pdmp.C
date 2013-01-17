@@ -49,6 +49,8 @@
 #include "Pulsar/ITRFExtension.h"
 #include "Pulsar/Site.h"
 
+#include <omp.h>
+
 #include <sys/stat.h>
 #include <assert.h>
 
@@ -174,7 +176,7 @@ void scrunchPartially(Archive * scrunchedCopy);
 
 // Get the SNR for the archive.
 float getSNR(const Profile * p);  // For use with standard profiles!
-float getSNR(const Profile * p, float rms, int minwidthbins);
+float getSNR(const Profile * p, float rms, int minwidthbins, FortranSNR &test_obj);
 float getSNR(const Profile * p, float rms, int minwidthbins, int maxwidthbins);
 
 // Get the RMS of the archive
@@ -497,6 +499,18 @@ map<char, int> siteCode2Index;
 
 // A convenience type for the mapping
 typedef pair<char, int> entry;
+
+struct BestValues {
+  double bestSNR;
+  double bestPeriod_bc_us;
+  double bestPdot;
+  double bestDM;
+  double bestFreq;
+  unsigned bestPulseWidth;
+  double freqError;
+  Reference::To<Profile> bestProfile;
+  Reference::To<Archive> bestArchive;
+};
 
 void usage (bool verbose_usage)
 {
@@ -1521,35 +1535,63 @@ void solve_and_plot (Archive* archive,
 	if (!silent) cout << "Searching for optimum DM and Period...";
 
 	// Begin the search for optimum DM and Period
+  // p
 	// Foreach DM
+  double backup_DM = archive->get_dispersion_measure ();
 
-        double backup_DM = archive->get_dispersion_measure ();
+  // Size the array for the number of snrs that will be extracted
+  SNRs.resize(dmBins * (periodBins + 1));
 
+  /*
+  for(int i = 0; i < max_threads; ++i) {
+  for(int j = 0; j < 2; ++j) {
+    SNRs.clear();
+    double bestSNR;
+    omp_set_num_threads(i + 1);
+    */
+    RealTimer timer;
+  int max_threads = omp_get_max_threads();
+  BestValues bestValues[max_threads];
 
-	printf("\n DM: %d   P1: %d   P0: %d\n",dmBins,pdotBins,periodBins);
-	for (int dmBin = 0; dmBin < dmBins ; dmBin++)
-        {
-                archive->set_dispersion_measure(currDM);
+  printf("\n DM: %d   P1: %d   P0: %d\n",dmBins,pdotBins,periodBins);
+	for (int dmBin = 0; dmBin < dmBins ; dmBin++) {
+    archive->set_dispersion_measure(currDM);
 		// total(false) scrunches in frequency but not time
 		Reference::To<Archive> dmLoopCopy = archive->total(false);
 
 		// Foreach Pdot
-
-		for (int pdotBin=0; pdotBin <= pdotBins; pdotBin++){
+    for (int pdotBin=0; pdotBin <= pdotBins; pdotBin++) {
 			int nptrial=0;
 			// Foreach Period (include one extra period bin at the end to scale with
 			// the plot
+
+      #pragma omp parallel default(none) \
+        firstprivate(dmLoopCopy) \
+        shared(currPd, currDM, minP, dmBin, pdotBin, nptrial, SNRs, \
+               bestSNR, stderr, bestPeriod_bc_us, dopplerFactor, bestPdot, \
+               bestDM, bestFreq, freqError, bestArchive, bestProfile, \
+               bestPulseWidth, refDM, refP_us, verbose, rms, \
+               minwidthbins, reference_time, periodBins, periodStep_us, pdotSNRs, cerr, bestValues)
+      {
+      #ifdef _OPENMP
+      if(dmBin == 0)
+        if(omp_get_thread_num() == 0)
+          cerr << omp_get_num_threads() << " ";
+      #endif
+
+      FortranSNR test_obj;
+
+      #pragma omp for
 			for (int periodBin = 0; periodBin <= periodBins; periodBin++) {
-
-				// print out the search progress
-				int percentComplete = (int)floor(100 * ((double)(periodBins*(1+pdotBins)*dmBin + periodBins*pdotBin + periodBin) / 
-							(double)(periodBins * dmBins * (1+pdotBins))));
-
-				int displayPercentage = (int)floor((double)percentComplete/SHOW_EVERY_PERCENT_COMPLETE);
-				if (!silent) printf("%3d%%\r", displayPercentage*SHOW_EVERY_PERCENT_COMPLETE);
-
 				// Create a new (unscrunched) copy so the values can be testedget
 				Reference::To<Archive> periodLoopCopy = dmLoopCopy->clone();
+
+        #ifdef _OPENMP
+        double currP = minP;
+        for(int i = 0; i < periodBin; ++i) {
+          currP += periodStep_us;
+        }
+        #endif
 
 				// set the trial period and dm value and update
 				double newFoldingPeriod = currP/(double)MICROSEC;
@@ -1559,7 +1601,7 @@ void solve_and_plot (Archive* archive,
 
 				periodLoopCopy->tscrunch();
 
-				snr = getSNR(periodLoopCopy->get_Profile(0,0,0), rms, minwidthbins);
+				double snr = getSNR(periodLoopCopy->get_Profile(0,0,0), rms, minwidthbins, test_obj);
 
 				if (verbose)	{
 					printf( "\nrefP topo = %3.10g, Set P = %3.15g dP = %3.15g\n",
@@ -1568,44 +1610,57 @@ void solve_and_plot (Archive* archive,
 							refDM, currDM, currDM - refDM, snr);
 				}
 
-				if (snr > bestSNR) {
+        int thread_num = omp_get_thread_num();
+        // Compare with threads best snr
+        if (snr > bestValues[thread_num].bestSNR) {
+          bestValues[thread_num].bestSNR = snr;
+          bestValues[thread_num].bestPeriod_bc_us = currP / dopplerFactor;
+          bestValues[thread_num].bestPdot = currPd;
+          bestValues[thread_num].bestDM = currDM;
+          bestValues[thread_num].bestFreq = 1/(bestPeriod_bc_us/(double)MICROSEC);
+          bestValues[thread_num].freqError = fabs((periodStep_us/(double)MICROSEC)/pow((bestPeriod_bc_us/(double)MICROSEC), 2));
+          periodLoopCopy->remove_baseline();
+          bestValues[thread_num].bestArchive = periodLoopCopy->clone();
+          bestValues[thread_num].bestProfile = periodLoopCopy->get_Profile(FIRST_SUBINT, FIRST_POL, FIRST_CHAN);
+          // get the width of the pulse
+          bestValues[thread_num].bestPulseWidth = test_obj.get_bestwidth();
+        }
+          
+        #ifndef _OPENMP
+        currP += periodStep_us;
+        #endif
+        
+        nptrial++;
 
-					if (verbose) {
-						fprintf(stderr, "Better S/N found: Old snr = %3.15g, New snr = %3.15g, Best DM = %3.15g and period = %3.15g \n", bestSNR, snr, currDM, newFoldingPeriod * MILLISEC);
-					}
+      // put this intensity into array
+        SNRs[dmBin * (periodBins + 1) + periodBin] = (float)snr;
+      }
+    } // end of parallel region
 
-					bestSNR = snr;
-					bestPeriod_bc_us = currP / dopplerFactor;
-					bestPdot = currPd;
-					bestDM = currDM;
-					bestFreq = 1/(bestPeriod_bc_us/(double)MICROSEC);
-					freqError = fabs((periodStep_us/(double)MICROSEC)/pow((bestPeriod_bc_us/(double)MICROSEC), 2));
-					periodLoopCopy->remove_baseline();
-          bestArchive = periodLoopCopy->clone();
-					bestProfile = periodLoopCopy->get_Profile(FIRST_SUBINT, FIRST_POL, FIRST_CHAN);
+    // CALCULATE BEST VALUES
+    BestValues best = bestValues[0];
+    for(int i = 1; i < max_threads; ++i) {
+      if(bestValues[i].bestSNR > best.bestSNR) {
+        best = bestValues[i];
+      }
+    }
+    bestSNR = best.bestSNR;
+    bestPeriod_bc_us = best.bestPeriod_bc_us;
+    bestPdot = best.bestPdot;
+    bestDM = best.bestDM;
+    bestFreq = best.bestFreq;
+    freqError = best.freqError;
+    bestArchive = best.bestArchive;
+    bestProfile = best.bestProfile;
+    bestPulseWidth = best.bestPulseWidth;
 
-					// get the width of the pulse
+    int snrsize = (dmBin + 1) * (periodBins + 1);
 
-					bestPulseWidth = snr_obj.get_bestwidth();
-
-					//int rise, fall;
-					//find_spike_edges(bestProfile, rise, fall);
-					//
-					//if (rise > fall)
-					//	bestPulseWidth = fall + (nbin - rise);
-					//else
-					//	bestPulseWidth = fall-rise;
-				}
-
-				// put this intensity into array
-				SNRs.push_back((float)snr);
-				currP += periodStep_us;
-				nptrial++;
-			}
-
-			int i = 0;
-			int snroff = SNRs.size() - nptrial;
-			snr=0;
+    int i = 0;
+    //int snroff = SNRs.size() - nptrial;
+    int snroff = snrsize - nptrial;
+    snr=0;
+      //printf("size: %d, periodBins: %d, snroff: %d\n", snrsize, periodBins, snroff);
 			// get best SNR for this pdot trial...
 			for (int periodBin = 0; periodBin <= periodBins; periodBin++) {
 				if (SNRs[snroff+i] > snr)snr=SNRs[snroff+i];
@@ -1620,21 +1675,19 @@ void solve_and_plot (Archive* archive,
 			}
 
 
-			if (pdotBin){
-
-				int snroff = SNRs.size() - nptrial;
+			if (pdotBin) {
+				int snroff = snrsize - nptrial;
 				int i = 1;
 				// correct the SNR array to account for pdot.
 				for (int periodBin = 0; periodBin <= periodBins; periodBin++) {
 					snr = SNRs.back();
-					SNRs.pop_back();
+          SNRs.pop_back();
 					if ( snr > SNRs[snroff-i]){
 						SNRs[snroff-i]=(float)snr;
 					}
 					i++;
 				}
-			}
-
+      }
 
 
 			// Reset the initial period value
@@ -1647,8 +1700,16 @@ void solve_and_plot (Archive* archive,
 		currPd = minPd;
 		currDM += dmStep;
 	}
+  timer.stop();
+  double time = timer.get_elapsed();
+  cerr << " " << time << endl;
+  /*
+  }
+  }
+  */
 
-        archive->set_dispersion_measure( backup_DM );
+
+  archive->set_dispersion_measure( backup_DM );
 
 
 	// get the error
@@ -1954,14 +2015,14 @@ float getSNR(const Profile * p){
 }
 
 
-float getSNR (const Profile * p, float rms, int minwidthbins) {
+float getSNR (const Profile * p, float rms, int minwidthbins, FortranSNR &test_obj) {
 
   // cerr << "getSNR rms=" << rms << " minwidth=" << minwidthbins << endl;
 
-	snr_obj.set_rms( rms );
-	snr_obj.set_minwidthbins (minwidthbins);
-	snr_obj.set_maxwidthbins (p->get_nbin()/2);
-	return snr_obj.get_snr (p);
+	test_obj.set_rms( rms );
+	test_obj.set_minwidthbins (minwidthbins);
+	test_obj.set_maxwidthbins (p->get_nbin()/2);
+	return test_obj.get_snr (p);
 }
 
 float getSNR (const Profile * p, float rms, int minwidthbins, int maxwidthbins) {

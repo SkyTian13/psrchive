@@ -50,9 +50,9 @@ void Pulsar::Integration::remove_baseline (const PhaseWeight* baseline) try
   {
     if (verbose)
       cerr << "Pulsar::Integration::remove_baseline ichan=" << ichan << endl;
-
+    
     shift.get_weight (ichan, &shifted_baseline);
-
+    
     for (unsigned ipol=0; ipol<get_npol(); ipol++)
     {
       if (verbose)
