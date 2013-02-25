@@ -1549,8 +1549,11 @@ void solve_and_plot (Archive* archive,
     double bestSNR;
     omp_set_num_threads(i + 1);
     */
-    RealTimer timer;
-  int max_threads = omp_get_max_threads();
+  RealTimer timer;
+  int max_threads = 1;
+  #ifdef _OPENMP
+  max_threads = omp_get_max_threads();
+  #endif
   BestValues bestValues[max_threads];
 
   printf("\n DM: %d   P1: %d   P0: %d\n",dmBins,pdotBins,periodBins);
@@ -1610,7 +1613,10 @@ void solve_and_plot (Archive* archive,
 							refDM, currDM, currDM - refDM, snr);
 				}
 
-        int thread_num = omp_get_thread_num();
+        int thread_num = 0;
+        #ifdef _OPENMP
+        thread_num = omp_get_thread_num();
+        #endif
         // Compare with threads best snr
         if (snr > bestValues[thread_num].bestSNR) {
           bestValues[thread_num].bestSNR = snr;
